@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Client Pointage avec WebSocket
-Communication temps réel avec le serveur
-Inclut le calcul de la durée de session
+PointTrack - Système de Pointage Professionnel
+Interface moderne avec gestion avancée
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+from tkinter import ttk, messagebox
 import socketio
 import socket
 import platform
@@ -20,355 +19,486 @@ from datetime import datetime
 
 class Config:
     SERVEUR_URL = 'http://192.168.88.16:5000'
-    CONFIG_DIR = Path.home() / '.pointage_client'
+    CONFIG_DIR = Path.home() / '.pointtrack'
     CONFIG_FILE = CONFIG_DIR / 'config.json'
-    LOG_FILE = CONFIG_DIR / 'pointage.log'
-    HEARTBEAT_INTERVAL = 30  # secondes
-    
+    HEARTBEAT_INTERVAL = 30
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-# ==================== CLIENT WEBSOCKET ====================
+# ==================== WEBSOCKET CLIENT ====================
 
 class WebSocketClient:
-    def __init__(self, app_instance):
-        self.app = app_instance
+    def __init__(self, app):
+        self.app = app
         self.sio = socketio.Client(reconnection=True, reconnection_attempts=0, reconnection_delay=5)
         self.connected = False
         self.machine_id = None
         self.setup_events()
-    
+
     def setup_events(self):
-        """Configuration des événements WebSocket"""
-        
         @self.sio.on('connect')
         def on_connect():
             self.connected = True
-            self.app.log("🔌 WebSocket connecté")
             self.app.update_ws_status(True)
-            
-            # Enregistrer la machine
+            self.app.show_notification("Connexion établie", "success")
             self.register_machine()
-        
+
         @self.sio.on('disconnect')
         def on_disconnect():
             self.connected = False
-            self.app.log("❌ WebSocket déconnecté")
             self.app.update_ws_status(False)
-        
-        @self.sio.on('registered')
-        def on_registered(data):
-            self.app.log(f"✅ Machine enregistrée: {data.get('machineId')}")
-        
-        @self.sio.on('heartbeat_ack')
-        def on_heartbeat_ack(data):
-            pass  # Heartbeat silencieux
-        
+            self.app.show_notification("Connexion perdue", "error")
+
         @self.sio.on('pointage_confirmed')
         def on_pointage_confirmed(data):
-            pointage_type = data.get('type', 'inconnu')
-            self.app.log(f"✅ Pointage {pointage_type} confirmé")
-            self.app.log(f"   ID: {data.get('id')}")
-            
-            # Si c'est une extinction avec durée
-            if pointage_type == 'extinction' and 'sessionDuration' in data:
-                duration = data['sessionDuration']
-                self.app.log(f"   ⏱️  Durée session: {duration.get('formatted', 'N/A')}")
-                self.app.log(f"   📊 Total heures: {duration.get('hours', 0):.2f}h")
-        
-        @self.sio.on('command')
-        def on_command(data):
-            """Recevoir une commande du serveur"""
-            command = data.get('command')
-            self.app.log(f"📥 Commande reçue: {command}")
-            
-            if command == 'request_pointage':
-                self.app.log("   → Envoi pointage automatique...")
-                self.app.root.after(0, lambda: self.app.envoyer_pointage('allumage'))
-            
-            elif command == 'shutdown':
-                self.app.log("   → Demande d'extinction...")
-                self.app.root.after(0, self.app.on_closing)
-        
-        @self.sio.on('status_update')
-        def on_status_update(data):
-            """Mise à jour du statut depuis le serveur"""
-            self.app.log(f"📊 Statut mis à jour: {data.get('status')}")
-        
-        @self.sio.on('error')
-        def on_error(data):
-            self.app.log(f"❌ Erreur serveur: {data.get('message')}")
-    
+            t = data.get('type')
+            msg = f"Pointage {t} enregistré"
+            if t == 'extinction' and 'sessionDuration' in data:
+                d = data['sessionDuration']
+                msg += f"\nDurée: {d['formatted']}"
+            self.app.show_notification(msg, "success")
+
     def connect(self, url):
-        """Se connecter au serveur WebSocket"""
         try:
-            self.app.log(f"🔗 Connexion à {url}...")
             self.sio.connect(url, wait_timeout=10)
             return True
         except Exception as e:
-            self.app.log(f"❌ Erreur connexion: {e}")
+            self.app.show_notification(f"Erreur: {str(e)}", "error")
             return False
-    
+
     def disconnect(self):
-        """Se déconnecter"""
         if self.connected:
             self.sio.disconnect()
-    
+
     def register_machine(self):
-        """Enregistrer la machine auprès du serveur"""
-        machine_id = self.app.obtenir_id_machine()
-        machine_name = self.app.obtenir_nom_machine()
-        machine_ip = self.app.obtenir_ip_locale()
-        system_info = self.app.obtenir_info_systeme()
-        
-        self.machine_id = machine_id
-        
+        self.machine_id = self.app.obtenir_id_machine()
         self.sio.emit('register_machine', {
-            'machineId': machine_id,
-            'machineName': machine_name,
-            'machineIp': machine_ip,
-            'systemInfo': system_info
+            'machineId': self.machine_id,
+            'machineName': self.app.obtenir_nom_machine(),
+            'machineIp': self.app.obtenir_ip_locale(),
+            'systemInfo': self.app.obtenir_info_systeme()
         })
-    
+
     def send_heartbeat(self):
-        """Envoyer un heartbeat"""
         if self.connected and self.machine_id:
             self.sio.emit('heartbeat', {
                 'machineId': self.machine_id,
                 'timestamp': datetime.now().isoformat()
             })
-    
+
     def send_pointage(self, type_pointage, session_duration_seconds=None):
-        """Envoyer un pointage via WebSocket avec durée de session optionnelle"""
         if not self.connected:
-            raise Exception("WebSocket non connecté")
-        
-        pointage_data = {
+            raise Exception("Non connecté au serveur")
+        data = {
             'machineId': self.machine_id,
             'machineName': self.app.obtenir_nom_machine(),
             'machineIp': self.app.obtenir_ip_locale(),
             'type': type_pointage,
             'timestamp': datetime.now().isoformat()
         }
-        
-        # Ajouter la durée de session si c'est une extinction
         if type_pointage == 'extinction' and session_duration_seconds is not None:
             hours = session_duration_seconds / 3600
-            pointage_data['sessionDuration'] = {
+            data['sessionDuration'] = {
                 'seconds': session_duration_seconds,
                 'hours': round(hours, 2),
                 'formatted': self._format_duration(session_duration_seconds)
             }
-            
-            self.app.log(f"⏱️  Durée de la session: {pointage_data['sessionDuration']['formatted']}")
-            self.app.log(f"📊 Total: {hours:.2f} heures")
-        
-        self.sio.emit('pointage', pointage_data)
-    
+        self.sio.emit('pointage', data)
+
     def _format_duration(self, seconds):
-        """Formater la durée en HH:MM:SS"""
-        hours = seconds // 3600
-        minutes = (seconds % 3600) // 60
-        secs = seconds % 60
-        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        h, s = divmod(seconds, 3600)
+        m, s = divmod(s, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"
 
-# ==================== APPLICATION TKINTER ====================
+# ==================== APPLICATION PRINCIPALE ====================
 
-class PointageClientApp:
+class PointTrackApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Client Pointage Machine - WebSocket")
-        self.root.geometry("700x900")
-        self.root.resizable(True, True)
+        self.root.title("PointTrack")
+        self.root.geometry("800x600")
+        self.root.minsize(700, 500)
         
-        # Variables
-        self.ws_connected = tk.BooleanVar(value=False)
-        self.auto_pointage = tk.BooleanVar(value=True)
+        # Couleurs professionnelles
+        self.colors = {
+            'bg': '#0f172a',
+            'card': '#1e293b',
+            'accent': '#3b82f6',
+            'success': '#10b981',
+            'error': '#ef4444',
+            'warning': '#f59e0b',
+            'text': '#f8fafc',
+            'text_dim': '#94a3b8',
+            'border': '#334155'
+        }
+        
+        self.root.configure(bg=self.colors['bg'])
+        
+        self.ws_client = WebSocketClient(self)
         self.session_start = None
         self.elapsed_seconds = 0
-        
-        # Client WebSocket
-        self.ws_client = WebSocketClient(self)
         self.heartbeat_running = False
+        self.current_view = "main"
         
-        # Setup UI
         self.setup_ui()
-        
-        # Timers
         self.update_elapsed_time()
         self.root.after(2000, self.connect_websocket)
-        
-        # Protocole de fermeture
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-    
+
     def setup_ui(self):
-        """Interface utilisateur"""
+        # Container principal
+        self.main_container = tk.Frame(self.root, bg=self.colors['bg'])
+        self.main_container.pack(fill=tk.BOTH, expand=True)
         
         # Header
-        header_frame = tk.Frame(self.root, bg="#2563eb", height=80)
-        header_frame.pack(fill=tk.X)
-        header_frame.pack_propagate(False)
+        self.create_header()
         
-        tk.Label(
-            header_frame,
-            text="🖥️ Client Pointage Machine - WebSocket",
-            font=("Arial", 16, "bold"),
-            bg="#2563eb",
-            fg="white"
-        ).pack(pady=25)
+        # Content area
+        self.content_frame = tk.Frame(self.main_container, bg=self.colors['bg'])
+        self.content_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
         
-        # Informations Machine
-        info_frame = ttk.LabelFrame(self.root, text="📋 Informations Machine", padding=15)
-        info_frame.pack(fill=tk.X, padx=20, pady=10)
+        # Vue principale
+        self.main_view = tk.Frame(self.content_frame, bg=self.colors['bg'])
+        self.main_view.pack(fill=tk.BOTH, expand=True)
         
-        machine_id = self.obtenir_id_machine()
-        machine_name = self.obtenir_nom_machine()
-        machine_ip = self.obtenir_ip_locale()
-        system_info = self.obtenir_info_systeme()
+        # Vue paramètres
+        self.settings_view = tk.Frame(self.content_frame, bg=self.colors['bg'])
         
-        info_data = [
-            ("ID Machine:", machine_id),
-            ("Nom:", machine_name),
-            ("Adresse IP:", machine_ip),
-            ("Système:", f"{system_info['system']} {system_info['release']}"),
+        self.create_main_view()
+        self.create_settings_view()
+        self.show_view("main")
+
+    def create_header(self):
+        header = tk.Frame(self.main_container, bg=self.colors['card'], height=70)
+        header.pack(fill=tk.X, padx=20, pady=(20, 10))
+        header.pack_propagate(False)
+        
+        # Logo et titre
+        left_frame = tk.Frame(header, bg=self.colors['card'])
+        left_frame.pack(side=tk.LEFT, padx=20)
+        
+        tk.Label(left_frame, text="⚡", font=("Segoe UI", 28), 
+                bg=self.colors['card'], fg=self.colors['accent']).pack(side=tk.LEFT)
+        tk.Label(left_frame, text="PointTrack", font=("Segoe UI", 18, "bold"), 
+                bg=self.colors['card'], fg=self.colors['text']).pack(side=tk.LEFT, padx=10)
+        
+        # Navigation
+        nav_frame = tk.Frame(header, bg=self.colors['card'])
+        nav_frame.pack(side=tk.RIGHT, padx=20)
+        
+        self.btn_main = tk.Button(nav_frame, text="🏠 Accueil", 
+                                  command=lambda: self.show_view("main"),
+                                  bg=self.colors['accent'], fg=self.colors['text'],
+                                  font=("Segoe UI", 10), relief=tk.FLAT, 
+                                  padx=15, pady=8, cursor="hand2")
+        self.btn_main.pack(side=tk.LEFT, padx=5)
+        
+        self.btn_settings = tk.Button(nav_frame, text="⚙️ Paramètres", 
+                                      command=lambda: self.show_view("settings"),
+                                      bg=self.colors['border'], fg=self.colors['text'],
+                                      font=("Segoe UI", 10), relief=tk.FLAT, 
+                                      padx=15, pady=8, cursor="hand2")
+        self.btn_settings.pack(side=tk.LEFT, padx=5)
+        
+        # Status indicator
+        self.status_frame = tk.Frame(header, bg=self.colors['card'])
+        self.status_frame.pack(side=tk.RIGHT, padx=20)
+        
+        self.status_dot = tk.Canvas(self.status_frame, width=12, height=12, 
+                                    bg=self.colors['card'], highlightthickness=0)
+        self.status_dot.pack(side=tk.LEFT, padx=5)
+        self.status_circle = self.status_dot.create_oval(2, 2, 10, 10, fill="#6b7280")
+        
+        self.status_text = tk.Label(self.status_frame, text="Déconnecté", 
+                                   font=("Segoe UI", 9), bg=self.colors['card'], 
+                                   fg=self.colors['text_dim'])
+        self.status_text.pack(side=tk.LEFT)
+
+    def create_main_view(self):
+        # Info machine card
+        info_card = self.create_card(self.main_view, "📋 Informations Machine")
+        info_card.pack(fill=tk.X, pady=(0, 15))
+        
+        info_grid = tk.Frame(info_card, bg=self.colors['card'])
+        info_grid.pack(fill=tk.X, padx=20, pady=15)
+        
+        machine_data = [
+            ("ID Machine", self.obtenir_id_machine()),
+            ("Nom", self.obtenir_nom_machine()),
+            ("Adresse IP", self.obtenir_ip_locale()),
+            ("Système", f"{platform.system()} {platform.release()}")
         ]
         
-        for i, (label, value) in enumerate(info_data):
-            tk.Label(info_frame, text=label, font=("Arial", 9, "bold")).grid(
-                row=i, column=0, sticky="w", pady=3
-            )
-            tk.Label(info_frame, text=value, font=("Arial", 9)).grid(
-                row=i, column=1, sticky="w", padx=10, pady=3
-            )
+        for i, (label, value) in enumerate(machine_data):
+            row = i // 2
+            col = i % 2
+            
+            item_frame = tk.Frame(info_grid, bg=self.colors['card'])
+            item_frame.grid(row=row, column=col, sticky="ew", padx=10, pady=8)
+            info_grid.columnconfigure(col, weight=1)
+            
+            tk.Label(item_frame, text=label, font=("Segoe UI", 9), 
+                    fg=self.colors['text_dim'], bg=self.colors['card'], 
+                    anchor="w").pack(anchor="w")
+            tk.Label(item_frame, text=value, font=("Segoe UI", 11, "bold"), 
+                    fg=self.colors['text'], bg=self.colors['card'], 
+                    anchor="w").pack(anchor="w")
         
-        # Statut WebSocket
-        status_frame = ttk.LabelFrame(self.root, text="🌐 Statut WebSocket", padding=15)
-        status_frame.pack(fill=tk.X, padx=20, pady=10)
+        # Session card
+        session_card = self.create_card(self.main_view, "⏱️ Session de Travail")
+        session_card.pack(fill=tk.BOTH, expand=True, pady=(0, 15))
         
-        status_inner = tk.Frame(status_frame)
-        status_inner.pack(fill=tk.X)
+        session_content = tk.Frame(session_card, bg=self.colors['card'])
+        session_content.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
         
-        self.status_indicator = tk.Canvas(status_inner, width=20, height=20, bg="white", highlightthickness=0)
-        self.status_indicator.pack(side=tk.LEFT, padx=5)
-        self.status_circle = self.status_indicator.create_oval(2, 2, 18, 18, fill="gray")
+        self.session_status = tk.Label(session_content, text="Aucune session active",
+                                      font=("Segoe UI", 12), fg=self.colors['text_dim'],
+                                      bg=self.colors['card'])
+        self.session_status.pack(pady=(10, 5))
         
-        self.status_label = tk.Label(status_inner, text="Non connecté", font=("Arial", 10))
-        self.status_label.pack(side=tk.LEFT, padx=10)
-        
-        tk.Button(
-            status_inner,
-            text="🔄 Reconnecter",
-            command=self.reconnect_websocket,
-            bg="#e5e7eb",
-            relief=tk.FLAT,
-            padx=10
-        ).pack(side=tk.RIGHT)
-        
-        # Configuration
-        config_frame = ttk.LabelFrame(self.root, text="⚙️ Configuration", padding=15)
-        config_frame.pack(fill=tk.X, padx=20, pady=10)
-        
-        tk.Label(config_frame, text="URL Serveur:", font=("Arial", 9)).grid(
-            row=0, column=0, sticky="w", pady=5
-        )
-        
-        self.server_url_entry = tk.Entry(config_frame, font=("Arial", 9), width=35)
-        self.server_url_entry.insert(0, Config.SERVEUR_URL)
-        self.server_url_entry.grid(row=0, column=1, padx=10, pady=5)
-        
-        tk.Button(
-            config_frame,
-            text="💾 Sauvegarder",
-            command=self.save_config,
-            bg="#10b981",
-            fg="white",
-            relief=tk.FLAT,
-            padx=10
-        ).grid(row=0, column=2)
-        
-        # Session
-        session_frame = ttk.LabelFrame(self.root, text="⏱️ Session Actuelle", padding=15)
-        session_frame.pack(fill=tk.X, padx=20, pady=10)
-        
-        self.session_label = tk.Label(
-            session_frame,
-            text="Aucune session active",
-            font=("Arial", 12, "bold"),
-            fg="#6b7280"
-        )
-        self.session_label.pack(pady=5)
-        
-        self.elapsed_label = tk.Label(
-            session_frame,
-            text="00:00:00",
-            font=("Arial", 24, "bold"),
-            fg="#2563eb"
-        )
+        self.elapsed_label = tk.Label(session_content, text="00:00:00",
+                                     font=("Segoe UI", 48, "bold"), 
+                                     fg=self.colors['accent'], bg=self.colors['card'])
         self.elapsed_label.pack(pady=10)
         
-        # Affichage des heures
-        self.hours_label = tk.Label(
-            session_frame,
-            text="0.00 heures",
-            font=("Arial", 11),
-            fg="#6b7280"
-        )
+        self.hours_label = tk.Label(session_content, text="0.00 heures",
+                                   font=("Segoe UI", 14), fg=self.colors['text_dim'],
+                                   bg=self.colors['card'])
         self.hours_label.pack(pady=5)
         
         # Actions
-        actions_frame = ttk.LabelFrame(self.root, text="🎯 Actions", padding=15)
-        actions_frame.pack(fill=tk.X, padx=20, pady=10)
+        actions_frame = tk.Frame(session_content, bg=self.colors['card'])
+        actions_frame.pack(pady=20)
         
-        btn_frame = tk.Frame(actions_frame)
-        btn_frame.pack()
+        self.btn_allumage = tk.Button(actions_frame, text="🟢 Démarrer Session",
+                                      command=lambda: self.envoyer_pointage('allumage'),
+                                      bg=self.colors['success'], fg="white",
+                                      font=("Segoe UI", 12, "bold"), relief=tk.FLAT,
+                                      padx=30, pady=15, cursor="hand2",
+                                      activebackground="#059669")
         
-        self.btn_allumage = tk.Button(
-            btn_frame,
-            text="🟢 Pointage Allumage",
-            command=lambda: self.envoyer_pointage('allumage'),
-            bg="#10b981",
-            fg="white",
-            font=("Arial", 10, "bold"),
-            relief=tk.FLAT,
-            padx=20,
-            pady=10,
-            width=20
-        )
-        self.btn_allumage.pack(side=tk.LEFT, padx=5)
+        self.btn_extinction = tk.Button(actions_frame, text="🔴 Terminer Session",
+                                        command=lambda: self.envoyer_pointage('extinction'),
+                                        bg=self.colors['error'], fg="white",
+                                        font=("Segoe UI", 12, "bold"), relief=tk.FLAT,
+                                        padx=30, pady=15, cursor="hand2",
+                                        activebackground="#dc2626")
         
-        self.btn_extinction = tk.Button(
-            btn_frame,
-            text="🔴 Pointage Extinction",
-            command=lambda: self.envoyer_pointage('extinction'),
-            bg="#ef4444",
-            fg="white",
-            font=("Arial", 10, "bold"),
-            relief=tk.FLAT,
-            padx=20,
-            pady=10,
-            width=20
-        )
-        self.btn_extinction.pack(side=tk.LEFT, padx=5)
+        # Notification area
+        self.notification_frame = tk.Frame(self.main_view, bg=self.colors['card'], 
+                                          height=0)
+        self.notification_frame.pack(fill=tk.X)
+        self.notification_label = tk.Label(self.notification_frame, text="",
+                                          font=("Segoe UI", 10), bg=self.colors['card'],
+                                          fg=self.colors['text'], pady=10)
         
-        # Logs
-        logs_frame = ttk.LabelFrame(self.root, text="📝 Logs", padding=10)
-        logs_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=(10, 20))
+        self.update_action_buttons()
+
+    def create_settings_view(self):
+        settings_card = self.create_card(self.settings_view, "⚙️ Configuration")
+        settings_card.pack(fill=tk.BOTH, expand=True)
         
-        self.log_text = scrolledtext.ScrolledText(
-            logs_frame,
-            height=8,
-            font=("Consolas", 9),
-            bg="#f9fafb",
-            wrap=tk.WORD
-        )
-        self.log_text.pack(fill=tk.BOTH, expand=True)
+        content = tk.Frame(settings_card, bg=self.colors['card'])
+        content.pack(fill=tk.BOTH, expand=True, padx=30, pady=30)
         
-        # Log initial
-        self.log("✨ Application démarrée (Mode WebSocket)")
-        self.log(f"📍 Machine: {machine_id}")
-        self.log(f"🌐 Serveur: {Config.SERVEUR_URL}")
-    
-    # ==================== MÉTHODES UTILITAIRES ====================
-    
+        # URL Serveur
+        tk.Label(content, text="URL du Serveur", font=("Segoe UI", 11, "bold"),
+                fg=self.colors['text'], bg=self.colors['card'], anchor="w").pack(anchor="w", pady=(0, 5))
+        
+        url_frame = tk.Frame(content, bg=self.colors['bg'], highlightbackground=self.colors['border'],
+                            highlightthickness=1)
+        url_frame.pack(fill=tk.X, pady=(0, 20))
+        
+        self.url_entry = tk.Entry(url_frame, font=("Segoe UI", 11), bg=self.colors['bg'],
+                                 fg=self.colors['text'], relief=tk.FLAT, 
+                                 insertbackground=self.colors['text'])
+        self.url_entry.pack(fill=tk.X, padx=10, pady=10)
+        self.url_entry.insert(0, self.charger_config().get('server_url', Config.SERVEUR_URL))
+        
+        # Boutons
+        btn_frame = tk.Frame(content, bg=self.colors['card'])
+        btn_frame.pack(fill=tk.X, pady=20)
+        
+        tk.Button(btn_frame, text="💾 Enregistrer",
+                 command=self.save_settings,
+                 bg=self.colors['success'], fg="white",
+                 font=("Segoe UI", 11, "bold"), relief=tk.FLAT,
+                 padx=25, pady=12, cursor="hand2").pack(side=tk.LEFT, padx=(0, 10))
+        
+        tk.Button(btn_frame, text="🔄 Tester Connexion",
+                 command=self.test_connection,
+                 bg=self.colors['accent'], fg="white",
+                 font=("Segoe UI", 11, "bold"), relief=tk.FLAT,
+                 padx=25, pady=12, cursor="hand2").pack(side=tk.LEFT)
+        
+        # Info
+        info_frame = tk.Frame(content, bg=self.colors['bg'], 
+                             highlightbackground=self.colors['border'], highlightthickness=1)
+        info_frame.pack(fill=tk.X, pady=20)
+        
+        tk.Label(info_frame, text="ℹ️ Les modifications seront appliquées après redémarrage",
+                font=("Segoe UI", 9), fg=self.colors['text_dim'],
+                bg=self.colors['bg']).pack(padx=15, pady=15)
+
+    def create_card(self, parent, title):
+        card = tk.Frame(parent, bg=self.colors['card'], 
+                       highlightbackground=self.colors['border'], highlightthickness=1)
+        
+        title_frame = tk.Frame(card, bg=self.colors['card'])
+        title_frame.pack(fill=tk.X, padx=20, pady=(15, 10))
+        
+        tk.Label(title_frame, text=title, font=("Segoe UI", 13, "bold"),
+                fg=self.colors['text'], bg=self.colors['card']).pack(anchor="w")
+        
+        return card
+
+    def show_view(self, view_name):
+        self.current_view = view_name
+        
+        if view_name == "main":
+            self.settings_view.pack_forget()
+            self.main_view.pack(fill=tk.BOTH, expand=True)
+            self.btn_main.config(bg=self.colors['accent'])
+            self.btn_settings.config(bg=self.colors['border'])
+        else:
+            self.main_view.pack_forget()
+            self.settings_view.pack(fill=tk.BOTH, expand=True)
+            self.btn_settings.config(bg=self.colors['accent'])
+            self.btn_main.config(bg=self.colors['border'])
+
+    def update_action_buttons(self):
+        if self.session_start:
+            self.btn_allumage.pack_forget()
+            self.btn_extinction.pack()
+        else:
+            self.btn_extinction.pack_forget()
+            self.btn_allumage.pack()
+
+    def show_notification(self, message, type="info"):
+        colors = {
+            "success": self.colors['success'],
+            "error": self.colors['error'],
+            "warning": self.colors['warning'],
+            "info": self.colors['accent']
+        }
+        
+        self.notification_label.config(text=message, fg=colors.get(type, self.colors['text']))
+        self.notification_frame.config(bg=colors.get(type, self.colors['card']))
+        self.notification_label.config(bg=colors.get(type, self.colors['card']))
+        self.notification_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        self.root.after(4000, lambda: self.notification_frame.pack_forget())
+
+    def update_ws_status(self, connected):
+        if connected:
+            self.status_dot.itemconfig(self.status_circle, fill=self.colors['success'])
+            self.status_text.config(text="Connecté", fg=self.colors['success'])
+        else:
+            self.status_dot.itemconfig(self.status_circle, fill=self.colors['error'])
+            self.status_text.config(text="Déconnecté", fg=self.colors['error'])
+
+    def save_settings(self):
+        new_url = self.url_entry.get().strip()
+        if not new_url.startswith('http'):
+            messagebox.showerror("Erreur", "L'URL doit commencer par http:// ou https://")
+            return
+        
+        config = self.charger_config()
+        config['server_url'] = new_url
+        self.sauvegarder_config(config)
+        Config.SERVEUR_URL = new_url
+        
+        self.show_notification("Configuration enregistrée", "success")
+        messagebox.showinfo("Succès", "Redémarrez l'application pour appliquer les changements")
+
+    def test_connection(self):
+        url = self.url_entry.get().strip()
+        self.show_notification("Test de connexion...", "info")
+        
+        def test():
+            try:
+                test_client = socketio.Client()
+                test_client.connect(url, wait_timeout=5)
+                test_client.disconnect()
+                self.root.after(0, lambda: self.show_notification("Connexion réussie !", "success"))
+            except Exception as e:
+                self.root.after(0, lambda: self.show_notification(f"Échec: {str(e)}", "error"))
+        
+        threading.Thread(target=test, daemon=True).start()
+
+    def connect_websocket(self):
+        threading.Thread(target=lambda: self.ws_client.connect(Config.SERVEUR_URL) 
+                        and self.start_heartbeat(), daemon=True).start()
+
+    def start_heartbeat(self):
+        if self.heartbeat_running:
+            return
+        self.heartbeat_running = True
+        
+        def beat():
+            while self.heartbeat_running:
+                if self.ws_client.connected:
+                    self.ws_client.send_heartbeat()
+                time.sleep(Config.HEARTBEAT_INTERVAL)
+        
+        threading.Thread(target=beat, daemon=True).start()
+
+    def envoyer_pointage(self, type_pointage):
+        def send():
+            try:
+                duration = None
+                if type_pointage == 'extinction' and self.session_start:
+                    duration = int((datetime.now() - self.session_start).total_seconds())
+                
+                self.ws_client.send_pointage(type_pointage, duration)
+                
+                if type_pointage == 'allumage':
+                    self.session_start = datetime.now()
+                    self.elapsed_seconds = 0
+                    self.root.after(0, lambda: self.session_status.config(
+                        text="Session active", fg=self.colors['success']))
+                else:
+                    self.session_start = None
+                    self.elapsed_seconds = 0
+                    self.root.after(0, lambda: self.session_status.config(
+                        text="Aucune session active", fg=self.colors['text_dim']))
+                    self.root.after(0, lambda: self.elapsed_label.config(text="00:00:00"))
+                    self.root.after(0, lambda: self.hours_label.config(text="0.00 heures"))
+                
+                self.root.after(0, self.update_action_buttons)
+                
+            except Exception as e:
+                self.root.after(0, lambda: self.show_notification(str(e), "error"))
+        
+        threading.Thread(target=send, daemon=True).start()
+
+    def update_elapsed_time(self):
+        if self.session_start:
+            self.elapsed_seconds = int((datetime.now() - self.session_start).total_seconds())
+            h, s = divmod(self.elapsed_seconds, 3600)
+            m, s = divmod(s, 60)
+            self.elapsed_label.config(text=f"{h:02d}:{m:02d}:{s:02d}")
+            self.hours_label.config(text=f"{self.elapsed_seconds / 3600:.2f} heures")
+        self.root.after(1000, self.update_elapsed_time)
+
+    def on_closing(self):
+        if self.session_start:
+            rep = messagebox.askyesnocancel("Session active", 
+                                           "Voulez-vous terminer la session ?")
+            if rep is None:
+                return
+            if rep:
+                try:
+                    dur = int((datetime.now() - self.session_start).total_seconds())
+                    self.ws_client.send_pointage('extinction', dur)
+                    time.sleep(0.5)
+                except:
+                    pass
+        
+        self.heartbeat_running = False
+        self.ws_client.disconnect()
+        self.root.destroy()
+
+    # Méthodes utilitaires
     def obtenir_id_machine(self):
         config = self.charger_config()
         if 'machine_id' in config:
@@ -377,216 +507,44 @@ class PointageClientApp:
         machine_id = hostname.replace(' ', '-').replace('.', '-').upper()
         self.sauvegarder_config({'machine_id': machine_id})
         return machine_id
-    
+
     def obtenir_nom_machine(self):
         return socket.gethostname()
-    
+
     def obtenir_ip_locale(self):
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("8.8.8.8", 80))
+                return s.getsockname()[0]
         except:
             return "127.0.0.1"
-    
+
     def obtenir_info_systeme(self):
-        return {
-            'system': platform.system(),
-            'release': platform.release(),
-            'version': platform.version(),
-            'machine': platform.machine()
-        }
-    
+        return {'system': platform.system(), 'release': platform.release()}
+
     def charger_config(self):
         try:
             if Config.CONFIG_FILE.exists():
-                with open(Config.CONFIG_FILE, 'r') as f:
+                with open(Config.CONFIG_FILE) as f:
                     return json.load(f)
         except:
             pass
         return {}
-    
+
     def sauvegarder_config(self, data):
         try:
             config = self.charger_config()
             config.update(data)
             with open(Config.CONFIG_FILE, 'w') as f:
                 json.dump(config, f, indent=2)
-            return True
-        except:
-            return False
-    
-    def log(self, message):
-        timestamp = datetime.now().strftime('%H:%M:%S')
-        log_entry = f"[{timestamp}] {message}\n"
-        self.log_text.insert(tk.END, log_entry)
-        self.log_text.see(tk.END)
-        
-        try:
-            with open(Config.LOG_FILE, 'a', encoding='utf-8') as f:
-                f.write(log_entry)
         except:
             pass
-    
-    # ==================== WEBSOCKET ====================
-    
-    def connect_websocket(self):
-        """Connexion WebSocket dans un thread"""
-        def _connect():
-            success = self.ws_client.connect(Config.SERVEUR_URL)
-            if success:
-                self.start_heartbeat()
-        
-        threading.Thread(target=_connect, daemon=True).start()
-    
-    def reconnect_websocket(self):
-        """Reconnecter WebSocket"""
-        self.log("🔄 Tentative de reconnexion...")
-        self.ws_client.disconnect()
-        time.sleep(1)
-        self.connect_websocket()
-    
-    def update_ws_status(self, connected):
-        """Mettre à jour le statut visuel"""
-        self.ws_connected.set(connected)
-        if connected:
-            self.status_indicator.itemconfig(self.status_circle, fill="#10b981")
-            self.status_label.config(text="✅ WebSocket connecté", fg="#10b981")
-        else:
-            self.status_indicator.itemconfig(self.status_circle, fill="#ef4444")
-            self.status_label.config(text="❌ WebSocket déconnecté", fg="#ef4444")
-    
-    def start_heartbeat(self):
-        """Démarrer le heartbeat automatique"""
-        if self.heartbeat_running:
-            return
-        
-        self.heartbeat_running = True
-        self.log(f"💓 Heartbeat démarré ({Config.HEARTBEAT_INTERVAL}s)")
-        
-        def _heartbeat():
-            while self.heartbeat_running:
-                if self.ws_client.connected:
-                    self.ws_client.send_heartbeat()
-                time.sleep(Config.HEARTBEAT_INTERVAL)
-        
-        threading.Thread(target=_heartbeat, daemon=True).start()
-    
-    def stop_heartbeat(self):
-        """Arrêter le heartbeat"""
-        self.heartbeat_running = False
-        self.log("💓 Heartbeat arrêté")
-    
-    # ==================== ACTIONS ====================
-    
-    def save_config(self):
-        new_url = self.server_url_entry.get().strip()
-        if not new_url:
-            messagebox.showerror("Erreur", "L'URL ne peut pas être vide")
-            return
-        
-        Config.SERVEUR_URL = new_url
-        self.sauvegarder_config({'server_url': new_url})
-        self.log(f"💾 Configuration sauvegardée")
-        messagebox.showinfo("Succès", "Configuration sauvegardée !\nReconnectez pour appliquer.")
-    
-    def envoyer_pointage(self, type_pointage):
-        """Envoyer un pointage via WebSocket avec calcul de durée"""
-        def _send():
-            self.root.after(0, lambda: self.btn_allumage.config(state=tk.DISABLED))
-            self.root.after(0, lambda: self.btn_extinction.config(state=tk.DISABLED))
-            
-            try:
-                self.log(f"📤 Envoi pointage {type_pointage} (WebSocket)...")
-                
-                # Calculer la durée si c'est une extinction
-                session_duration = None
-                if type_pointage == 'extinction' and self.session_start:
-                    session_duration = int((datetime.now() - self.session_start).total_seconds())
-                    self.log(f"⏱️  Calcul durée session: {session_duration} secondes")
-                
-                # Envoyer le pointage avec la durée
-                self.ws_client.send_pointage(type_pointage, session_duration)
-                
-                # Mettre à jour la session
-                if type_pointage == 'allumage':
-                    self.session_start = datetime.now()
-                    self.elapsed_seconds = 0
-                    self.root.after(0, lambda: self.session_label.config(
-                        text="Session active", fg="#10b981"
-                    ))
-                else:
-                    self.session_start = None
-                    self.elapsed_seconds = 0
-                    self.root.after(0, lambda: self.session_label.config(
-                        text="Aucune session active", fg="#6b7280"
-                    ))
-                    self.root.after(0, lambda: self.elapsed_label.config(text="00:00:00"))
-                    self.root.after(0, lambda: self.hours_label.config(text="0.00 heures"))
-                
-                self.root.after(0, lambda: messagebox.showinfo(
-                    "Succès", f"Pointage {type_pointage} envoyé !"
-                ))
-            
-            except Exception as e:
-                self.log(f"❌ Erreur: {e}")
-                self.root.after(0, lambda: messagebox.showerror(
-                    "Erreur", f"Impossible d'envoyer le pointage:\n{e}"
-                ))
-            
-            finally:
-                self.root.after(0, lambda: self.btn_allumage.config(state=tk.NORMAL))
-                self.root.after(0, lambda: self.btn_extinction.config(state=tk.NORMAL))
-        
-        threading.Thread(target=_send, daemon=True).start()
-    
-    def update_elapsed_time(self):
-        """Mettre à jour le chronomètre"""
-        if self.session_start:
-            self.elapsed_seconds = int((datetime.now() - self.session_start).total_seconds())
-            hours = self.elapsed_seconds // 3600
-            minutes = (self.elapsed_seconds % 3600) // 60
-            seconds = self.elapsed_seconds % 60
-            self.elapsed_label.config(text=f"{hours:02d}:{minutes:02d}:{seconds:02d}")
-            
-            # Afficher les heures décimales
-            total_hours = self.elapsed_seconds / 3600
-            self.hours_label.config(text=f"{total_hours:.2f} heures")
-        
-        self.root.after(1000, self.update_elapsed_time)
-    
-    def on_closing(self):
-        """Fermeture de l'application"""
-        if self.session_start:
-            response = messagebox.askyesnocancel(
-                "Session active",
-                "Envoyer un pointage d'extinction ?"
-            )
-            
-            if response is None:
-                return
-            elif response:
-                try:
-                    # Calculer la durée de la session
-                    session_duration = int((datetime.now() - self.session_start).total_seconds())
-                    self.ws_client.send_pointage('extinction', session_duration)
-                    self.log("✅ Pointage extinction envoyé avec durée")
-                    time.sleep(0.5)
-                except:
-                    pass
-        
-        self.log("👋 Fermeture...")
-        self.stop_heartbeat()
-        self.ws_client.disconnect()
-        self.root.destroy()
 
 # ==================== MAIN ====================
 
 def main():
     root = tk.Tk()
-    app = PointageClientApp(root)
+    PointTrackApp(root)
     root.mainloop()
 
 if __name__ == '__main__':
