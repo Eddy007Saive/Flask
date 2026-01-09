@@ -1,13 +1,26 @@
+#!/usr/bin/env python3
+"""
+Serveur de Pointage Unifié
+- API REST pour le frontend React (dashboard web)
+- WebSocket pour les clients de pointage (communication temps réel)
+"""
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from flask_socketio import SocketIO, emit, join_room, leave_room
 from datetime import datetime, timedelta
 import sqlite3
 import os
 
 app = Flask(__name__)
-CORS(app)  # Permet les requêtes cross-origin depuis le frontend
+CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*")
 
-# Initialiser la base de données
+# Stockage des clients connectés via WebSocket
+connected_clients = {}  # {machine_id: {sid: session_id, info: {...}}}
+
+# ==================== BASE DE DONNÉES ====================
+
 def init_db():
     conn = sqlite3.connect('pointages.db')
     c = conn.cursor()
@@ -20,8 +33,10 @@ def init_db():
             ip TEXT UNIQUE NOT NULL,
             status TEXT DEFAULT 'inactive',
             last_pointage TIMESTAMP,
+            last_heartbeat TIMESTAMP,
             email TEXT,
-            total_hours_today REAL DEFAULT 0
+            total_hours_today REAL DEFAULT 0,
+            connected INTEGER DEFAULT 0
         )
     ''')
     
@@ -34,6 +49,8 @@ def init_db():
             type TEXT NOT NULL,
             timestamp TIMESTAMP NOT NULL,
             ip TEXT NOT NULL,
+            session_duration_seconds INTEGER,
+            session_duration_hours REAL,
             FOREIGN KEY (machine_id) REFERENCES machines(id)
         )
     ''')
@@ -54,13 +71,313 @@ def init_db():
     
     conn.commit()
     conn.close()
+    
+    # Vérifier et ajouter les colonnes manquantes (migration)
+    migrate_db_columns()
+
+def migrate_db_columns():
+    """Ajoute les colonnes manquantes dans une base de données existante"""
+    conn = sqlite3.connect('pointages.db')
+    c = conn.cursor()
+    
+    print("🔧 Vérification de la structure de la base de données...")
+    
+    try:
+        # Vérifier les colonnes de 'machines'
+        c.execute("PRAGMA table_info(machines)")
+        machine_columns = [col[1] for col in c.fetchall()]
+        
+        if 'last_heartbeat' not in machine_columns:
+            print("   ➕ Ajout de la colonne 'last_heartbeat' à 'machines'")
+            c.execute('ALTER TABLE machines ADD COLUMN last_heartbeat TIMESTAMP')
+        
+        if 'connected' not in machine_columns:
+            print("   ➕ Ajout de la colonne 'connected' à 'machines'")
+            c.execute('ALTER TABLE machines ADD COLUMN connected INTEGER DEFAULT 0')
+        
+        if 'total_hours_today' not in machine_columns:
+            print("   ➕ Ajout de la colonne 'total_hours_today' à 'machines'")
+            c.execute('ALTER TABLE machines ADD COLUMN total_hours_today REAL DEFAULT 0')
+        
+        # Vérifier les colonnes de 'pointages'
+        c.execute("PRAGMA table_info(pointages)")
+        pointage_columns = [col[1] for col in c.fetchall()]
+        
+        if 'session_duration_seconds' not in pointage_columns:
+            print("   ➕ Ajout de la colonne 'session_duration_seconds' à 'pointages'")
+            c.execute('ALTER TABLE pointages ADD COLUMN session_duration_seconds INTEGER')
+        
+        if 'session_duration_hours' not in pointage_columns:
+            print("   ➕ Ajout de la colonne 'session_duration_hours' à 'pointages'")
+            c.execute('ALTER TABLE pointages ADD COLUMN session_duration_hours REAL')
+        
+        # S'assurer que total_hours_today n'est pas NULL
+        c.execute('UPDATE machines SET total_hours_today = 0 WHERE total_hours_today IS NULL')
+        
+        conn.commit()
+        print("✅ Structure de la base de données vérifiée")
+        
+    except Exception as e:
+        print(f"❌ Erreur lors de la migration: {e}")
+    finally:
+        conn.close()
 
 def get_db():
     conn = sqlite3.connect('pointages.db')
     conn.row_factory = sqlite3.Row
     return conn
 
-# ==================== ROUTES MACHINES ====================
+# ==================== WEBSOCKET EVENTS (Clients de pointage) ====================
+
+@socketio.on('connect')
+def handle_connect():
+    """Un client se connecte"""
+    print(f"🔌 Client connecté: {request.sid}")
+    emit('connected', {'message': 'Connexion établie', 'sid': request.sid})
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    """Un client se déconnecte"""
+    print(f"❌ Client déconnecté: {request.sid}")
+    
+    # Trouver et mettre à jour la machine
+    machine_id = None
+    for mid, info in connected_clients.items():
+        if info.get('sid') == request.sid:
+            machine_id = mid
+            break
+    
+    if machine_id:
+        print(f"   Machine: {machine_id}")
+        del connected_clients[machine_id]
+        
+        # Mettre à jour la base de données
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('''
+            UPDATE machines 
+            SET connected = 0, status = 'inactive'
+            WHERE id = ?
+        ''', (machine_id,))
+        conn.commit()
+        conn.close()
+        
+        # Notifier tous les dashboards web
+        socketio.emit('machine_disconnected', {
+            'machineId': machine_id,
+            'timestamp': datetime.now().isoformat()
+        }, room='dashboard')
+
+@socketio.on('register_machine')
+def handle_register_machine(data):
+    """Enregistrement d'une machine cliente via WebSocket"""
+    machine_id = data.get('machineId')
+    machine_name = data.get('machineName')
+    machine_ip = data.get('machineIp', request.remote_addr)
+    system_info = data.get('systemInfo', {})
+    
+    if not machine_id:
+        emit('error', {'message': 'machineId requis'})
+        return
+    
+    print(f"📝 Enregistrement machine WebSocket: {machine_id} ({machine_name})")
+    
+    # Stocker dans le dictionnaire des clients connectés
+    connected_clients[machine_id] = {
+        'sid': request.sid,
+        'machine_name': machine_name,
+        'machine_ip': machine_ip,
+        'system_info': system_info,
+        'connected_at': datetime.now().isoformat()
+    }
+    
+    # Mettre à jour la base de données
+    conn = get_db()
+    c = conn.cursor()
+    
+    c.execute('SELECT * FROM machines WHERE id = ?', (machine_id,))
+    machine = c.fetchone()
+    
+    is_new_machine = machine is None
+    
+    if not machine:
+        # Créer la machine
+        c.execute('''
+            INSERT INTO machines (id, name, ip, status, last_heartbeat, connected)
+            VALUES (?, ?, ?, 'active', ?, 1)
+        ''', (machine_id, machine_name, machine_ip, datetime.now().isoformat()))
+        print(f"   🆕 Nouvelle machine créée")
+    else:
+        # Mettre à jour
+        c.execute('''
+            UPDATE machines 
+            SET connected = 1, status = 'active', last_heartbeat = ?, ip = ?
+            WHERE id = ?
+        ''', (datetime.now().isoformat(), machine_ip, machine_id))
+        print(f"   ♻️  Machine existante mise à jour")
+    
+    conn.commit()
+    conn.close()
+    
+    # Rejoindre une room pour cette machine
+    join_room(machine_id)
+    
+    # Confirmer l'enregistrement au client
+    emit('registered', {
+        'machineId': machine_id,
+        'message': 'Machine enregistrée avec succès',
+        'timestamp': datetime.now().isoformat()
+    })
+    
+    # Notifier tous les dashboards web
+    socketio.emit('machine_connected', {
+        'machineId': machine_id,
+        'machineName': machine_name,
+        'machineIp': machine_ip,
+        'timestamp': datetime.now().isoformat()
+    }, room='dashboard')
+
+@socketio.on('heartbeat')
+def handle_heartbeat(data):
+    """Heartbeat régulier du client"""
+    machine_id = data.get('machineId')
+    
+    if not machine_id:
+        return
+    
+    # Mettre à jour le dernier heartbeat
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('''
+        UPDATE machines 
+        SET last_heartbeat = ?
+        WHERE id = ?
+    ''', (datetime.now().isoformat(), machine_id))
+    conn.commit()
+    conn.close()
+    
+    # Répondre au heartbeat
+    emit('heartbeat_ack', {'timestamp': datetime.now().isoformat()})
+
+@socketio.on('pointage')
+def handle_pointage_ws(data):
+    """Réception d'un pointage via WebSocket"""
+    machine_id = data.get('machineId')
+    machine_name = data.get('machineName')
+    machine_ip = data.get('machineIp', request.remote_addr)
+    pointage_type = data.get('type', 'allumage')
+    session_duration = data.get('sessionDuration')  # Peut être None
+    
+    if not machine_id:
+        emit('error', {'message': 'machineId requis'})
+        return
+    
+    print(f"📊 Pointage WebSocket {pointage_type}: {machine_id}")
+    
+    conn = get_db()
+    c = conn.cursor()
+    
+    # Créer le pointage
+    pointage_id = f"p-{datetime.now().timestamp()}"
+    timestamp = datetime.now().isoformat()
+    
+    # Extraire les données de durée si présentes
+    duration_seconds = None
+    duration_hours = None
+    if session_duration:
+        duration_seconds = session_duration.get('seconds')
+        duration_hours = session_duration.get('hours')
+        print(f"   ⏱️  Durée session: {session_duration.get('formatted')} ({duration_hours:.2f}h)")
+    
+    c.execute('''
+        INSERT INTO pointages (id, machine_id, machine_name, type, timestamp, ip, 
+                              session_duration_seconds, session_duration_hours)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (pointage_id, machine_id, machine_name or machine_id, pointage_type, 
+          timestamp, machine_ip, duration_seconds, duration_hours))
+    
+    # Mettre à jour le statut et les heures de la machine
+    new_status = 'active' if pointage_type == 'allumage' else 'inactive'
+    
+    # Si c'est une extinction avec durée, mettre à jour total_hours_today
+    if pointage_type == 'extinction' and duration_hours:
+        c.execute('''
+            UPDATE machines 
+            SET status = ?, last_pointage = ?, total_hours_today = total_hours_today + ?
+            WHERE id = ?
+        ''', (new_status, timestamp, duration_hours, machine_id))
+    else:
+        c.execute('''
+            UPDATE machines 
+            SET status = ?, last_pointage = ? 
+            WHERE id = ?
+        ''', (new_status, timestamp, machine_id))
+    
+    conn.commit()
+    conn.close()
+    
+    # Confirmer au client (avec la durée si présente)
+    confirmation_data = {
+        'id': pointage_id,
+        'machineId': machine_id,
+        'type': pointage_type,
+        'timestamp': timestamp
+    }
+    if session_duration:
+        confirmation_data['sessionDuration'] = session_duration
+    
+    emit('pointage_confirmed', confirmation_data)
+    
+    # Notifier tous les dashboards web en temps réel
+    notification_data = {
+        'id': pointage_id,
+        'machineId': machine_id,
+        'machineName': machine_name or machine_id,
+        'type': pointage_type,
+        'timestamp': timestamp
+    }
+    if session_duration:
+        notification_data['sessionDuration'] = session_duration
+    
+    socketio.emit('new_pointage', notification_data, room='dashboard')
+
+@socketio.on('get_status')
+def handle_get_status(data):
+    """Le client demande son statut"""
+    machine_id = data.get('machineId')
+    
+    if not machine_id:
+        return
+    
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT * FROM machines WHERE id = ?', (machine_id,))
+    machine = c.fetchone()
+    conn.close()
+    
+    if machine:
+        emit('status_update', {
+            'machineId': machine['id'],
+            'status': machine['status'],
+            'lastPointage': machine['last_pointage'],
+            'totalHoursToday': machine['total_hours_today']
+        })
+
+# ==================== WEBSOCKET EVENTS (Dashboard Web) ====================
+
+@socketio.on('dashboard_connected')
+def handle_dashboard_connected():
+    """Un dashboard web se connecte"""
+    print(f"🖥️  Dashboard connecté: {request.sid}")
+    join_room('dashboard')
+    
+    # Envoyer la liste des machines connectées
+    emit('connected_machines', {
+        'machines': list(connected_clients.keys()),
+        'count': len(connected_clients)
+    })
+
+# ==================== API REST (Frontend React) ====================
 
 @app.route('/api/machines', methods=['GET'])
 def get_machines():
@@ -74,14 +391,31 @@ def get_machines():
         
         result = []
         for m in machines:
+            # Gérer last_heartbeat qui peut ne pas exister dans les anciennes DB
+            last_heartbeat = None
+            try:
+                last_heartbeat = m['last_heartbeat']
+            except (KeyError, IndexError):
+                pass
+            
+            # Gérer connected qui peut ne pas exister dans les anciennes DB
+            connected = 0
+            try:
+                connected = m['connected']
+            except (KeyError, IndexError):
+                pass
+            
             result.append({
                 'id': m['id'],
                 'name': m['name'],
                 'ip': m['ip'],
                 'status': m['status'],
                 'lastPointage': m['last_pointage'],
+                'lastHeartbeat': last_heartbeat,
                 'email': m['email'],
-                'totalHoursToday': m['total_hours_today']
+                'totalHoursToday': m['total_hours_today'],
+                'connected': bool(connected),
+                'websocketConnected': m['id'] in connected_clients
             })
         
         return jsonify(result), 200
@@ -101,14 +435,31 @@ def get_machine(machine_id):
         if not machine:
             return jsonify({'error': 'Machine non trouvée'}), 404
         
+        # Gérer last_heartbeat qui peut ne pas exister
+        last_heartbeat = None
+        try:
+            last_heartbeat = machine['last_heartbeat']
+        except (KeyError, IndexError):
+            pass
+        
+        # Gérer connected qui peut ne pas exister
+        connected = 0
+        try:
+            connected = machine['connected']
+        except (KeyError, IndexError):
+            pass
+        
         return jsonify({
             'id': machine['id'],
             'name': machine['name'],
             'ip': machine['ip'],
             'status': machine['status'],
             'lastPointage': machine['last_pointage'],
+            'lastHeartbeat': last_heartbeat,
             'email': machine['email'],
-            'totalHoursToday': machine['total_hours_today']
+            'totalHoursToday': machine['total_hours_today'],
+            'connected': bool(connected),
+            'websocketConnected': machine_id in connected_clients
         }), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -166,13 +517,40 @@ def delete_machine(machine_id):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/machines/<machine_id>/command', methods=['POST'])
+def send_machine_command(machine_id):
+    """Envoie une commande à une machine via WebSocket"""
+    try:
+        data = request.get_json()
+        command = data.get('command')
+        
+        if not command:
+            return jsonify({'error': 'command requis'}), 400
+        
+        if machine_id not in connected_clients:
+            return jsonify({'error': 'Machine non connectée via WebSocket'}), 404
+        
+        # Envoyer via WebSocket
+        socketio.emit('command', {
+            'command': command,
+            'data': data.get('data', {}),
+            'timestamp': datetime.now().isoformat()
+        }, room=machine_id)
+        
+        return jsonify({
+            'message': 'Commande envoyée',
+            'machineId': machine_id,
+            'command': command
+        }), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 # ==================== ROUTES POINTAGES ====================
 
 @app.route('/api/pointages', methods=['GET'])
 def get_pointages():
     """Récupère tous les pointages avec filtres optionnels"""
     try:
-        # Paramètres de filtrage
         machine_id = request.args.get('machineId')
         start_date = request.args.get('startDate')
         end_date = request.args.get('endDate')
@@ -205,14 +583,26 @@ def get_pointages():
         
         result = []
         for p in pointages:
-            result.append({
+            pointage_dict = {
                 'id': p['id'],
                 'machineId': p['machine_id'],
                 'machineName': p['machine_name'],
                 'type': p['type'],
                 'timestamp': p['timestamp'],
                 'ip': p['ip']
-            })
+            }
+            
+            # Ajouter la durée si présente
+            try:
+                if p['session_duration_seconds']:
+                    pointage_dict['sessionDuration'] = {
+                        'seconds': p['session_duration_seconds'],
+                        'hours': p['session_duration_hours']
+                    }
+            except (KeyError, IndexError):
+                pass
+            
+            result.append(pointage_dict)
         
         return jsonify(result), 200
     except Exception as e:
@@ -220,16 +610,18 @@ def get_pointages():
 
 @app.route('/api/pointages', methods=['POST'])
 def create_pointage():
-    """Enregistre un nouveau pointage (allumage ou extinction)"""
+    """Enregistre un nouveau pointage (fallback HTTP si pas de WebSocket)"""
     try:
         data = request.get_json()
         machine_id = data.get('machineId')
-        machine_name = data.get('machineName')  # Nouveau paramètre
-        machine_ip = data.get('machineIp')      # Nouveau paramètre
-        pointage_type = data.get('type', 'allumage')  # 'allumage' ou 'extinction'
+        machine_name = data.get('machineName')
+        machine_ip = data.get('machineIp') or request.remote_addr
+        pointage_type = data.get('type', 'allumage')
         
         if not machine_id:
             return jsonify({'error': 'machineId requis'}), 400
+        
+        print(f"📊 Pointage HTTP {pointage_type}: {machine_id}")
         
         conn = get_db()
         c = conn.cursor()
@@ -238,13 +630,10 @@ def create_pointage():
         c.execute('SELECT * FROM machines WHERE id = ?', (machine_id,))
         machine = c.fetchone()
         
-        # ✅ Si la machine n'existe pas, la créer automatiquement
+        # Si la machine n'existe pas, la créer automatiquement
         if not machine:
-            # Valeurs par défaut si non fournies
             if not machine_name:
                 machine_name = f"Machine-{machine_id}"
-            if not machine_ip:
-                machine_ip = request.remote_addr  # Utiliser l'IP de la requête
             
             print(f"🆕 Nouvelle machine détectée : {machine_name} ({machine_ip})")
             
@@ -253,7 +642,6 @@ def create_pointage():
                 VALUES (?, ?, ?, 'inactive', ?)
             ''', (machine_id, machine_name, machine_ip, datetime.now().isoformat()))
             
-            # Recharger la machine nouvellement créée
             c.execute('SELECT * FROM machines WHERE id = ?', (machine_id,))
             machine = c.fetchone()
         
@@ -277,6 +665,15 @@ def create_pointage():
         conn.commit()
         conn.close()
         
+        # Notifier les dashboards web en temps réel
+        socketio.emit('new_pointage', {
+            'id': pointage_id,
+            'machineId': machine_id,
+            'machineName': machine['name'],
+            'type': pointage_type,
+            'timestamp': timestamp
+        }, room='dashboard')
+        
         return jsonify({
             'message': 'Pointage enregistré',
             'id': pointage_id,
@@ -284,11 +681,12 @@ def create_pointage():
             'machineName': machine['name'],
             'type': pointage_type,
             'timestamp': timestamp,
-            'isNewMachine': machine is None  # Indique si c'était une nouvelle machine
+            'isNewMachine': machine is None
         }), 201
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
 # ==================== ROUTES ALERTES ====================
 
 @app.route('/api/alerts', methods=['GET'])
@@ -353,24 +751,34 @@ def get_statistics():
         c = conn.cursor()
         
         # Total machines
-        result = c.execute('SELECT COUNT(*) as total FROM machines').fetchone()
+        c.execute('SELECT COUNT(*) as total FROM machines')
+        result = c.fetchone()
         total_machines = result['total'] if result else 0
         
         # Machines actives
-        result = c.execute('SELECT COUNT(*) as active FROM machines WHERE status = "active"').fetchone()
+        c.execute('SELECT COUNT(*) as active FROM machines WHERE status = "active"')
+        result = c.fetchone()
         active_machines = result['active'] if result else 0
         
+        # Machines connectées via WebSocket
+        c.execute('SELECT COUNT(*) as connected FROM machines WHERE connected = 1')
+        result = c.fetchone()
+        connected_machines = result['connected'] if result else 0
+        
         # Machines inactives
-        result = c.execute('SELECT COUNT(*) as inactive FROM machines WHERE status = "inactive"').fetchone()
+        c.execute('SELECT COUNT(*) as inactive FROM machines WHERE status = "inactive"')
+        result = c.fetchone()
         inactive_machines = result['inactive'] if result else 0
         
         # Total heures aujourd'hui
-        result = c.execute('SELECT SUM(total_hours_today) as total FROM machines').fetchone()
+        c.execute('SELECT SUM(total_hours_today) as total FROM machines')
+        result = c.fetchone()
         total_hours_today = result['total'] if result and result['total'] else 0
         
         # Pointages aujourd'hui
         today = datetime.now().date().isoformat()
-        result = c.execute('SELECT COUNT(*) as count FROM pointages WHERE DATE(timestamp) = ?', (today,)).fetchone()
+        c.execute('SELECT COUNT(*) as count FROM pointages WHERE DATE(timestamp) = ?', (today,))
+        result = c.fetchone()
         pointages_today = result['count'] if result else 0
         
         conn.close()
@@ -378,6 +786,8 @@ def get_statistics():
         return jsonify({
             'totalMachines': total_machines,
             'activeMachines': active_machines,
+            'connectedMachines': connected_machines,
+            'websocketClients': len(connected_clients),
             'inactiveMachines': inactive_machines,
             'totalHoursToday': round(total_hours_today, 2),
             'averageHoursPerMachine': round(total_hours_today / total_machines, 2) if total_machines > 0 else 0,
@@ -387,6 +797,7 @@ def get_statistics():
     except Exception as e:
         app.logger.error(f"Erreur dans get_statistics: {str(e)}")
         return jsonify({'error': str(e)}), 500
+
 # ==================== ROUTES RAPPORTS ====================
 
 @app.route('/api/reports', methods=['GET'])
@@ -428,8 +839,7 @@ def get_reports():
                     if p['type'] == 'allumage':
                         current_allumage = p
                     elif p['type'] == 'extinction' and current_allumage:
-                        # Calculer les heures (simplification)
-                        daily_details[date]['hoursWorked'] += 8  # Valeur par défaut
+                        daily_details[date]['hoursWorked'] += 8
                         current_allumage = None
             
             total_hours = sum(d['hoursWorked'] for d in daily_details.values())
@@ -465,14 +875,12 @@ def get_machine_report(machine_id):
         conn = get_db()
         c = conn.cursor()
         
-        # Récupérer la machine
         c.execute('SELECT * FROM machines WHERE id = ?', (machine_id,))
         machine = c.fetchone()
         
         if not machine:
             return jsonify({'error': 'Machine non trouvée'}), 404
         
-        # Récupérer les pointages
         start_date = (datetime.now() - timedelta(days=days)).isoformat()
         c.execute('''
             SELECT *
@@ -484,7 +892,6 @@ def get_machine_report(machine_id):
         
         conn.close()
         
-        # Formater les pointages
         pointages_list = []
         for p in pointages:
             pointages_list.append({
@@ -513,7 +920,6 @@ def get_chart_data():
         conn = get_db()
         c = conn.cursor()
         
-        # Compter les allumages et extinctions par heure
         c.execute('''
             SELECT 
                 strftime('%H:00', timestamp) as time,
@@ -549,7 +955,6 @@ def check_alerts():
         conn = get_db()
         c = conn.cursor()
         
-        # Trouver les machines inactives depuis plus de 24h
         threshold_24h = (datetime.now() - timedelta(hours=24)).isoformat()
         threshold_72h = (datetime.now() - timedelta(hours=72)).isoformat()
         
@@ -571,7 +976,6 @@ def check_alerts():
                 alert_type = 'warning'
                 message = f"Machine inactive depuis plus de 24h"
             
-            # Vérifier si une alerte similaire existe déjà
             c.execute('''
                 SELECT * FROM alerts 
                 WHERE machine_id = ? AND resolved = 0 AND type = ?
@@ -606,12 +1010,10 @@ def seed_data():
         conn = get_db()
         c = conn.cursor()
         
-        # Nettoyer les tables existantes
         c.execute('DELETE FROM alerts')
         c.execute('DELETE FROM pointages')
         c.execute('DELETE FROM machines')
         
-        # Machines de test
         machines_test = [
             ('1', 'PC-Bureau-01', '192.168.1.101', 'active', 'user1@company.com', 7.5),
             ('2', 'PC-Bureau-02', '192.168.1.102', 'active', 'user2@company.com', 6.2),
@@ -632,7 +1034,6 @@ def seed_data():
         
         print("✅ Machines insérées")
         
-        # Pointages de test (50 derniers pointages)
         pointage_types = ['allumage', 'extinction']
         for i in range(50):
             machine = machines_test[i % len(machines_test)]
@@ -653,7 +1054,6 @@ def seed_data():
         
         print("✅ Pointages insérés")
         
-        # Alertes de test
         alertes_test = [
             ('a1', 'inactive', '3', 'PC-Accueil', 'Machine inactive depuis plus de 24h', (datetime.now() - timedelta(hours=1)).isoformat(), 0),
             ('a2', 'inactive', '7', 'PC-RH', 'Machine inactive depuis plus de 72h', (datetime.now() - timedelta(hours=2)).isoformat(), 0),
@@ -688,7 +1088,6 @@ def insert_sample_data():
         conn = get_db()
         c = conn.cursor()
         
-        # Vérifier si des machines existent déjà
         c.execute('SELECT COUNT(*) as count FROM machines')
         count = c.fetchone()['count']
         
@@ -696,7 +1095,6 @@ def insert_sample_data():
             print("📦 Base de données vide - Insertion des données de test...")
             conn.close()
             
-            # Utiliser la route seed_data
             with app.test_client() as client:
                 response = client.post('/api/seed-data')
                 if response.status_code == 201:
@@ -714,33 +1112,64 @@ def insert_sample_data():
 
 if __name__ == '__main__':
     init_db()
-    insert_sample_data() 
-    app.run(debug=True)
-     # Insérer des données si la DB est vide
+    insert_sample_data()
     
-    print("\n🚀 Serveur API démarré sur http://0.0.0.0:5000")
-    print("\n📊 Routes disponibles:")
-    print("   Machines:")
-    print("   - GET    /api/machines")
-    print("   - POST   /api/machines")
-    print("   - GET    /api/machines/<id>")
-    print("   - PUT    /api/machines/<id>")
-    print("   - DELETE /api/machines/<id>")
-    print("\n   Pointages:")
-    print("   - GET    /api/pointages")
-    print("   - POST   /api/pointages")
-    print("\n   Alertes:")
-    print("   - GET    /api/alerts")
-    print("   - PUT    /api/alerts/<id>/resolve")
-    print("\n   Statistiques:")
-    print("   - GET    /api/statistics")
-    print("\n   Rapports:")
-    print("   - GET    /api/reports")
-    print("   - GET    /api/reports/<machine_id>")
-    print("\n   Graphiques:")
-    print("   - GET    /api/chart-data")
-    print("\n   Test:")
-    print("   - POST   /api/seed-data (réinitialiser avec données de test)")
-    print("\n💡 Testez avec: curl http://localhost:5000/api/machines")
+    print("\n" + "="*70)
+    print("🚀 SERVEUR DE POINTAGE UNIFIÉ DÉMARRÉ")
+    print("="*70)
+    print(f"\n📡 HTTP API:      http://0.0.0.0:5000")
+    print(f"🔌 WebSocket:     ws://0.0.0.0:5000")
+    print(f"\n💡 Architecture:")
+    print(f"   • Frontend React    → API REST (HTTP)")
+    print(f"   • Clients pointage  → WebSocket (temps réel)")
+    print(f"   • Dashboard web     → API REST + WebSocket (notifications)")
     
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    print(f"\n📊 Routes API disponibles:")
+    print(f"\n   Machines:")
+    print(f"   • GET    /api/machines")
+    print(f"   • POST   /api/machines")
+    print(f"   • GET    /api/machines/<id>")
+    print(f"   • PUT    /api/machines/<id>")
+    print(f"   • DELETE /api/machines/<id>")
+    print(f"   • POST   /api/machines/<id>/command (envoie commande via WebSocket)")
+    
+    print(f"\n   Pointages:")
+    print(f"   • GET    /api/pointages")
+    print(f"   • POST   /api/pointages (fallback HTTP)")
+    
+    print(f"\n   Alertes:")
+    print(f"   • GET    /api/alerts")
+    print(f"   • PUT    /api/alerts/<id>/resolve")
+    
+    print(f"\n   Statistiques:")
+    print(f"   • GET    /api/statistics")
+    
+    print(f"\n   Rapports:")
+    print(f"   • GET    /api/reports")
+    print(f"   • GET    /api/reports/<machine_id>")
+    
+    print(f"\n   Graphiques:")
+    print(f"   • GET    /api/chart-data")
+    
+    print(f"\n   Utilitaires:")
+    print(f"   • POST   /api/check-alerts")
+    print(f"   • POST   /api/seed-data (données de test)")
+    
+    print(f"\n🔌 Événements WebSocket:")
+    print(f"\n   Clients de pointage:")
+    print(f"   • register_machine   (enregistrement)")
+    print(f"   • pointage           (envoi pointage)")
+    print(f"   • heartbeat          (keep-alive)")
+    print(f"   • get_status         (demande statut)")
+    
+    print(f"\n   Dashboard web:")
+    print(f"   • dashboard_connected (connexion dashboard)")
+    print(f"   • machine_connected   (notification nouvelle machine)")
+    print(f"   • machine_disconnected (notification déconnexion)")
+    print(f"   • new_pointage        (notification nouveau pointage)")
+    
+    print(f"\n💡 Test rapide:")
+    print(f"   curl http://localhost:5000/api/machines")
+    print("="*70 + "\n")
+    
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True)
